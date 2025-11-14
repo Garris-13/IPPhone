@@ -1,10 +1,6 @@
-import javax.sound.sampled.*;
 import java.io.*;
 import java.net.*;
 import java.util.Scanner;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 public class IPPhone {
     private static final int DIAL_PORT = 6060;
@@ -12,18 +8,10 @@ public class IPPhone {
     private static final int MESSAGE_PORT = 6062;
 
     private String remoteIP;
-    private int remoteDialPort = DIAL_PORT;
-    private int remoteAudioPort = AUDIO_PORT;
-    private int remoteMessagePort = MESSAGE_PORT;
-
     private boolean isInCall = false;
-    private AudioFormat audioFormat;
-    private TargetDataLine microphone;
-    private SourceDataLine speakers;
     private String username;
-
-    private ScheduledExecutorService scheduler;
     private Scanner scanner;
+    private AudioManager audioManager;
 
     public static void main(String[] args) {
         IPPhone phone = new IPPhone();
@@ -31,55 +19,26 @@ public class IPPhone {
     }
 
     public IPPhone() {
-        this.scheduler = Executors.newScheduledThreadPool(2);
-        this.username = "User_" + System.currentTimeMillis() % 1000;
+        this.username = "User_" + (System.currentTimeMillis() % 1000);
         this.scanner = new Scanner(System.in);
+        this.audioManager = new AudioManager(AUDIO_PORT);
     }
 
     public void start() {
         System.out.println("=== Java IP Phone ===");
         System.out.println("用户名: " + username);
+        System.out.println("本地IP: " + getLocalIP());
 
-        if (initializeAudio()) {
-            startServer();
-            showMenu();
-        } else {
-            System.err.println("音频设备初始化失败，程序退出");
-        }
-    }
+        // 启动音频播放（一直监听音频数据）
+        audioManager.startPlaying();
 
-    private boolean initializeAudio() {
-        try {
-            audioFormat = new AudioFormat(16000, 16, 1, true, true);
-
-            DataLine.Info micInfo = new DataLine.Info(TargetDataLine.class, audioFormat);
-            if (!AudioSystem.isLineSupported(micInfo)) {
-                System.err.println("不支持麦克风音频格式");
-                return false;
-            }
-            microphone = (TargetDataLine) AudioSystem.getLine(micInfo);
-
-            DataLine.Info speakerInfo = new DataLine.Info(SourceDataLine.class, audioFormat);
-            if (!AudioSystem.isLineSupported(speakerInfo)) {
-                System.err.println("不支持扬声器音频格式");
-                return false;
-            }
-            speakers = (SourceDataLine) AudioSystem.getLine(speakerInfo);
-
-            System.out.println("音频设备初始化成功");
-            return true;
-
-        } catch (LineUnavailableException e) {
-            System.err.println("音频设备初始化失败: " + e.getMessage());
-            return false;
-        }
+        startServer();
+        showMenu();
     }
 
     private void startServer() {
         // 启动拨号服务器
         new Thread(new DialingServer()).start();
-        // 启动音频服务器
-        new Thread(new AudioServer()).start();
         // 启动消息服务器
         new Thread(new MessageServer()).start();
 
@@ -87,6 +46,7 @@ public class IPPhone {
         System.out.println("拨号端口: " + DIAL_PORT);
         System.out.println("音频端口: " + AUDIO_PORT);
         System.out.println("消息端口: " + MESSAGE_PORT);
+        System.out.println("等待来电或拨号...");
     }
 
     private void showMenu() {
@@ -94,7 +54,8 @@ public class IPPhone {
             System.out.println("\n=== IP Phone 菜单 ===");
             System.out.println("1. 拨号");
             System.out.println("2. 查看状态");
-            System.out.println("3. 退出");
+            System.out.println("3. 测试音频");
+            System.out.println("4. 退出");
             System.out.print("请选择: ");
 
             String choice = scanner.nextLine();
@@ -102,13 +63,16 @@ public class IPPhone {
             switch (choice) {
                 case "1":
                     System.out.print("输入目标IP地址: ");
-                    remoteIP = scanner.nextLine();
-                    dial(remoteIP);
+                    String ip = scanner.nextLine();
+                    dial(ip);
                     break;
                 case "2":
                     showStatus();
                     break;
                 case "3":
+                    testAudio();
+                    break;
+                case "4":
                     shutdown();
                     return;
                 default:
@@ -118,108 +82,89 @@ public class IPPhone {
     }
 
     private void dial(String ip) {
-        try (Socket socket = new Socket(ip, remoteDialPort);
+        if (isInCall) {
+            System.out.println("当前正在通话中，请先结束当前通话");
+            return;
+        }
+
+        this.remoteIP = ip;
+
+        try (Socket socket = new Socket(ip, DIAL_PORT);
              PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
              BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
 
             // 发送拨号请求
-            out.println("DIAL:" + username + "@" + getLocalIP());
+            out.println("DIAL:" + username);
+            System.out.println("正在呼叫 " + ip + "...");
+
+            // 等待响应
             String response = in.readLine();
-
-            if (response != null && response.startsWith("DIALING:")) {
-                System.out.println("拨号中...");
-                // 等待用户确认接听
-                acceptCall();
-            } else {
-                System.out.println("拨号失败: " + response);
-            }
-
-        } catch (IOException e) {
-            System.err.println("拨号失败: " + e.getMessage());
-        }
-    }
-
-    private void acceptCall() {
-        System.out.print("是否接听通话? (y/n): ");
-        String answer = scanner.nextLine();
-
-        if ("y".equalsIgnoreCase(answer)) {
-            try (Socket socket = new Socket(remoteIP, remoteDialPort);
-                 PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
-
-                out.println("ACCEPT:" + username + "-" + System.currentTimeMillis());
+            if (response != null && response.startsWith("ACCEPT")) {
                 System.out.println("通话已连接!");
                 startCall();
-
-            } catch (IOException e) {
-                System.err.println("接听通话失败: " + e.getMessage());
+            } else if (response != null && response.startsWith("REJECT")) {
+                System.out.println("对方拒绝接听");
+            } else {
+                System.out.println("呼叫失败: " + response);
             }
-        } else {
-            rejectCall();
-        }
-    }
 
-    private void rejectCall() {
-        try (Socket socket = new Socket(remoteIP, remoteDialPort);
-             PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
-
-            out.println("REJECT:" + username + "-" + System.currentTimeMillis());
-            System.out.println("已拒绝通话");
-
+        } catch (ConnectException e) {
+            System.err.println("无法连接到目标IP: " + ip);
         } catch (IOException e) {
-            System.err.println("拒绝通话失败: " + e.getMessage());
+            System.err.println("拨号失败: " + e.getMessage());
         }
     }
 
     private void startCall() {
         isInCall = true;
 
-        // 启动音频发送线程
-        new Thread(new AudioSender()).start();
-        // 启动音频接收线程
-        new Thread(new AudioReceiver()).start();
+        // 开始录音并发送音频
+        audioManager.startRecording(remoteIP, AUDIO_PORT);
 
-        System.out.println("通话中... 输入 'hangup' 结束通话");
+        System.out.println("=== 通话中 ===");
+        System.out.println("输入 'hangup' 结束通话");
+        System.out.println("输入其他内容发送文本消息");
+        System.out.println("=========================");
 
         // 通话控制循环
         while (isInCall) {
+            System.out.print(">> ");
             String input = scanner.nextLine();
+
             if ("hangup".equalsIgnoreCase(input)) {
                 endCall();
-            } else {
+            } else if (!input.trim().isEmpty()) {
                 sendMessage(input);
             }
         }
     }
 
     private void endCall() {
-        isInCall = false;
-        try {
-            // 发送结束通话消息
-            Socket socket = new Socket(remoteIP, remoteMessagePort);
-            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-            out.println("CALL_END");
-            socket.close();
-        } catch (IOException e) {
-            System.err.println("结束通话时出错: " + e.getMessage());
+        if (!isInCall) {
+            return;
         }
 
-        // 关闭音频设备
-        if (microphone != null && microphone.isOpen()) {
-            microphone.close();
-        }
-        if (speakers != null && speakers.isOpen()) {
-            speakers.close();
+        isInCall = false;
+
+        // 停止音频传输
+        audioManager.stopRecording();
+
+        // 发送结束通话消息
+        try (Socket socket = new Socket(remoteIP, MESSAGE_PORT);
+             PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
+            out.println("CALL_END");
+        } catch (IOException e) {
+            // 忽略结束通话时的错误
         }
 
         System.out.println("通话已结束");
     }
 
     private void sendMessage(String message) {
-        try (Socket socket = new Socket(remoteIP, remoteMessagePort);
+        try (Socket socket = new Socket(remoteIP, MESSAGE_PORT);
              PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
 
-            out.println("MESSAGE:" + message);
+            out.println("MSG:" + message);
             System.out.println("你: " + message);
 
         } catch (IOException e) {
@@ -227,37 +172,41 @@ public class IPPhone {
         }
     }
 
+    private void testAudio() {
+        System.out.println("开始音频测试...");
+        System.out.println("请对着麦克风说话，你应该能听到自己的声音（回音测试）");
+        System.out.println("测试将持续5秒...");
+
+        // 临时录制并播放自己的声音
+        audioManager.startRecording("127.0.0.1", AUDIO_PORT);
+
+        try {
+            Thread.sleep(5000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        audioManager.stopRecording();
+        System.out.println("音频测试结束");
+    }
+
     private void showStatus() {
         System.out.println("\n=== 系统状态 ===");
         System.out.println("用户名: " + username);
         System.out.println("本地IP: " + getLocalIP());
-        System.out.println("通话状态: " + (isInCall ? "通话中" : "空闲"));
-        System.out.println("音频设备: " + (microphone != null ? "就绪" : "未就绪"));
+        System.out.println("通话状态: " + (isInCall ? "通话中 (" + remoteIP + ")" : "空闲"));
+        System.out.println("音频录制: " + (audioManager.isRecording() ? "进行中" : "停止"));
+        System.out.println("音频播放: " + (audioManager.isPlaying() ? "进行中" : "停止"));
+        System.out.println("服务器端口: " + DIAL_PORT + "(拨号), " + AUDIO_PORT + "(音频), " + MESSAGE_PORT + "(消息)");
     }
 
     private void shutdown() {
+        System.out.println("正在关闭IP Phone...");
         isInCall = false;
-        scheduler.shutdown();
-        try {
-            if (!scheduler.awaitTermination(3, TimeUnit.SECONDS)) {
-                scheduler.shutdownNow();
-            }
-        } catch (InterruptedException e) {
-            scheduler.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
-
-        if (microphone != null) {
-            microphone.close();
-        }
-        if (speakers != null) {
-            speakers.close();
-        }
-
+        audioManager.close();
         if (scanner != null) {
             scanner.close();
         }
-
         System.out.println("IP Phone 已关闭，再见!");
     }
 
@@ -269,7 +218,7 @@ public class IPPhone {
         }
     }
 
-    // 拨号服务器
+    // 拨号服务器 - 处理来电
     class DialingServer implements Runnable {
         @Override
         public void run() {
@@ -284,7 +233,7 @@ public class IPPhone {
         }
     }
 
-    // 拨号处理器
+    // 拨号处理器 - 处理来电请求
     class DialingHandler implements Runnable {
         private Socket socket;
 
@@ -299,18 +248,24 @@ public class IPPhone {
 
                 String request = in.readLine();
                 if (request != null && request.startsWith("DIAL:")) {
-                    String callerInfo = request.substring(5);
-                    System.out.println("\n来电来自: " + callerInfo);
+                    String caller = request.substring(5);
+                    String callerIP = socket.getInetAddress().getHostAddress();
+
+                    System.out.println("\n=== 来电 ===");
+                    System.out.println("来自: " + caller + " (" + callerIP + ")");
                     System.out.print("是否接听? (y/n): ");
 
                     String answer = scanner.nextLine();
 
                     if ("y".equalsIgnoreCase(answer)) {
-                        out.println("DIALING:" + System.currentTimeMillis());
-                        remoteIP = socket.getInetAddress().getHostAddress();
+                        // 设置远程IP
+                        remoteIP = callerIP;
+                        out.println("ACCEPT");
+                        System.out.println("通话已连接!");
                         startCall();
                     } else {
-                        out.println("DIAL_REJECT:User declined");
+                        out.println("REJECT");
+                        System.out.println("已拒绝通话");
                     }
                 }
 
@@ -320,119 +275,7 @@ public class IPPhone {
         }
     }
 
-    // 音频服务器
-    class AudioServer implements Runnable {
-        @Override
-        public void run() {
-            try (DatagramSocket socket = new DatagramSocket(AUDIO_PORT)) {
-                byte[] buffer = new byte[1024];
-
-                while (true) {
-                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                    socket.receive(packet);
-
-                    if (isInCall && remoteIP.equals(packet.getAddress().getHostAddress())) {
-                        try {
-                            if (speakers != null && !speakers.isOpen()) {
-                                speakers.open(audioFormat);
-                                speakers.start();
-                            }
-                            if (speakers != null && speakers.isOpen()) {
-                                speakers.write(packet.getData(), 0, packet.getLength());
-                            }
-                        } catch (LineUnavailableException e) {
-                            System.err.println("扬声器错误: " + e.getMessage());
-                        }
-                    }
-                }
-            } catch (IOException e) {
-                System.err.println("音频服务器错误: " + e.getMessage());
-            }
-        }
-    }
-
-    // 音频发送器
-    class AudioSender implements Runnable {
-        @Override
-        public void run() {
-            try (DatagramSocket socket = new DatagramSocket()) {
-                try {
-                    microphone.open(audioFormat);
-                    microphone.start();
-                } catch (LineUnavailableException e) {
-                    System.err.println("无法打开麦克风: " + e.getMessage());
-                    return;
-                }
-
-                byte[] buffer = new byte[1024];
-
-                while (isInCall) {
-                    int bytesRead = microphone.read(buffer, 0, buffer.length);
-                    if (bytesRead > 0) {
-                        try {
-                            DatagramPacket packet = new DatagramPacket(
-                                    buffer, bytesRead,
-                                    InetAddress.getByName(remoteIP), remoteAudioPort
-                            );
-                            socket.send(packet);
-                        } catch (IOException e) {
-                            System.err.println("音频发送错误: " + e.getMessage());
-                        }
-                    }
-
-                    // 短暂休眠
-                    try {
-                        Thread.sleep(10);
-                    } catch (InterruptedException e) {
-                        break;
-                    }
-                }
-
-                microphone.close();
-            } catch (IOException e) {
-                System.err.println("音频发送器错误: " + e.getMessage());
-            }
-        }
-    }
-
-    // 音频接收器
-    class AudioReceiver implements Runnable {
-        @Override
-        public void run() {
-            try (DatagramSocket socket = new DatagramSocket(AUDIO_PORT + 1)) {
-                byte[] buffer = new byte[1024];
-
-                try {
-                    speakers.open(audioFormat);
-                    speakers.start();
-                } catch (LineUnavailableException e) {
-                    System.err.println("无法打开扬声器: " + e.getMessage());
-                    return;
-                }
-
-                while (isInCall) {
-                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                    try {
-                        socket.receive(packet);
-
-                        if (remoteIP.equals(packet.getAddress().getHostAddress())) {
-                            speakers.write(packet.getData(), 0, packet.getLength());
-                        }
-                    } catch (IOException e) {
-                        if (isInCall) {
-                            System.err.println("音频接收错误: " + e.getMessage());
-                        }
-                    }
-                }
-
-                speakers.close();
-            } catch (IOException e) {
-                System.err.println("音频接收器错误: " + e.getMessage());
-            }
-        }
-    }
-
-    // 消息服务器
+    // 消息服务器 - 处理文本消息
     class MessageServer implements Runnable {
         @Override
         public void run() {
@@ -447,7 +290,7 @@ public class IPPhone {
         }
     }
 
-    // 消息处理器
+    // 消息处理器 - 处理收到的消息
     class MessageHandler implements Runnable {
         private Socket socket;
 
@@ -461,18 +304,24 @@ public class IPPhone {
 
                 String message;
                 while ((message = in.readLine()) != null) {
-                    if (message.startsWith("MESSAGE:")) {
-                        System.out.println("\n对方: " + message.substring(8));
-                        System.out.print(">> ");
-                    } else if ("CALL_END".equals(message)) {
+                    if ("CALL_END".equals(message)) {
                         System.out.println("\n对方已挂断通话");
                         isInCall = false;
+                        audioManager.stopRecording();
                         break;
+                    } else if (message.startsWith("MSG:")) {
+                        String text = message.substring(4);
+                        System.out.println("\n对方: " + text);
+                        if (isInCall) {
+                            System.out.print(">> ");
+                        }
                     }
                 }
 
             } catch (IOException e) {
-                System.err.println("消息处理错误: " + e.getMessage());
+                if (isInCall) {
+                    System.err.println("消息处理错误: " + e.getMessage());
+                }
             }
         }
     }
